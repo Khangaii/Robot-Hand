@@ -1,0 +1,7 @@
+rtmpose-m/
+sketch_oct27c/
+.venv/
+__pycache__/
+
+hand_detect.py
+rtmpose_detect.zip

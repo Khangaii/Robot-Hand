@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Robot Hand Control</title>
+<style>
+  :root {
+    --bg: #14171c; --panel: #1d222a; --line: #2d3440;
+    --text: #e8ecf1; --muted: #8b96a5; --accent: #3da9fc;
+    --win: #3ddc84; --lose: #ff5c5c; --draw: #ffc857;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { padding: 12px 20px; border-bottom: 1px solid var(--line);
+           display: flex; align-items: center; gap: 16px; }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  .pill { font-size: 12px; padding: 2px 10px; border-radius: 99px;
+          background: var(--panel); border: 1px solid var(--line);
+          color: var(--muted); }
+  .pill.on { color: var(--win); border-color: var(--win); }
+  main { display: grid; grid-template-columns: minmax(320px, 1.4fr) minmax(300px, 1fr);
+         gap: 16px; padding: 16px 20px; align-items: start; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--line);
+           border-radius: 10px; padding: 14px; margin-bottom: 16px; }
+  .panel h2 { margin: 0 0 10px; font-size: 12px; letter-spacing: .06em;
+              text-transform: uppercase; color: var(--muted); font-weight: 600; }
+  .video { position: relative; background: #000; border-radius: 10px;
+           overflow: hidden; aspect-ratio: 4 / 3; }
+  .video img { width: 100%; height: 100%; object-fit: contain; display: block; }
+  .overlay { position: absolute; inset: 0; display: flex; flex-direction: column;
+             align-items: center; justify-content: center; pointer-events: none;
+             text-shadow: 0 2px 12px rgba(0,0,0,.8); text-align: center; }
+  .overlay .big { font-size: 96px; font-weight: 700; line-height: 1; }
+  .overlay .sub { font-size: 20px; margin-top: 10px; }
+  .overlay.win .big { color: var(--win); }
+  .overlay.lose .big { color: var(--lose); }
+  .overlay.draw .big { color: var(--draw); }
+  .status { margin-top: 10px; color: var(--muted); }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  button { font: inherit; color: var(--text); background: #262d38;
+           border: 1px solid var(--line); border-radius: 8px;
+           padding: 8px 14px; cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.active { background: var(--accent); border-color: var(--accent);
+                  color: #04121f; font-weight: 600; }
+  button.primary { background: var(--win); border-color: var(--win);
+                   color: #062414; font-weight: 600; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 3px 6px; }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; }
+  tr + tr td { border-top: 1px solid var(--line); }
+  .bar { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; }
+  .bar > i { display: block; height: 100%; background: var(--accent); width: 0; }
+  .score { display: flex; gap: 18px; font-size: 15px; }
+  .score b { font-size: 20px; }
+  #err { color: var(--lose); min-height: 18px; margin-top: 8px; }
+  details summary { cursor: pointer; color: var(--muted); margin-bottom: 8px; }
+  .scroll { max-height: 360px; overflow-y: auto; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Robot Hand Control</h1>
+  <span class="pill" id="pill-hand">no hand</span>
+  <span class="pill" id="pill-serial">robot: not connected</span>
+  <span class="pill" id="pill-fps">0 fps</span>
+</header>
+
+<main>
+  <section>
+    <div class="video">
+      <img src="/video" alt="Camera feed">
+      <div class="overlay" id="overlay"></div>
+    </div>
+    <div class="status" id="status">Connecting...</div>
+  </section>
+
+  <section>
+    <div class="panel">
+      <h2>Mode</h2>
+      <div class="row">
+        <button id="mode-follow" data-mode="follow">Follow hand</button>
+        <button id="mode-rps" data-mode="rps">Rock Paper Scissors</button>
+      </div>
+    </div>
+
+    <div class="panel hidden" id="rps-panel">
+      <h2>Rock Paper Scissors</h2>
+      <div class="row">
+        <button class="primary" id="rps-start">Start round</button>
+      </div>
+      <div class="score" style="margin-top:12px">
+        <span>Wins <b id="s-win">0</b></span>
+        <span>Losses <b id="s-lose">0</b></span>
+        <span>Draws <b id="s-draw">0</b></span>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Calibration</h2>
+      <div class="row">
+        <button id="cal-open">Calibrate OPEN hand</button>
+        <button id="cal-closed">Calibrate FIST</button>
+      </div>
+      <div class="status" id="cal-status"></div>
+      <div id="err"></div>
+    </div>
+
+    <div class="panel">
+      <h2>Fingers</h2>
+      <table>
+        <thead><tr><th>Finger</th><th>Measured</th><th>Command</th><th>State</th></tr></thead>
+        <tbody id="fingers"></tbody>
+      </table>
+    </div>
+
+    <div class="panel">
+      <details>
+        <summary>Hand skeleton values (21 landmarks)</summary>
+        <div class="scroll">
+          <table>
+            <thead><tr><th>#</th><th>Landmark</th><th>x</th><th>y</th><th>z</th></tr></thead>
+            <tbody id="landmarks"></tbody>
+          </table>
+        </div>
+        <div class="status">x, y: 0-1 across the image. z: depth relative to the wrist.</div>
+      </details>
+    </div>
+  </section>
+</main>
+
+<script>
+const ICON = { rock: "✊ Rock", paper: "✋ Paper", scissors: "✌️ Scissors" };
+const $ = id => document.getElementById(id);
+const fingersBody = $("fingers"), lmBody = $("landmarks");
+let lmBuilt = false, errTimer = null;
+
+function showError(msg) {
+  $("err").textContent = msg || "";
+  clearTimeout(errTimer);
+  if (msg) errTimer = setTimeout(() => $("err").textContent = "", 4000);
+}
+
+async function post(url, body) {
+  try {
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body || {}),
+    });
+    const data = await r.json();
+    if (!data.ok) showError(data.error);
+  } catch (e) { showError("Request failed: " + e); }
+}
+
+document.querySelectorAll("[data-mode]").forEach(b =>
+  b.onclick = () => post("/api/mode", { mode: b.dataset.mode }));
+$("cal-open").onclick = () => post("/api/calibrate", { pose: "open" });
+$("cal-closed").onclick = () => post("/api/calibrate", { pose: "closed" });
+$("rps-start").onclick = () => post("/api/rps/start");
+
+function renderOverlay(s) {
+  const o = $("overlay");
+  o.className = "overlay";
+  o.innerHTML = "";
+  if (s.mode !== "rps") return;
+  const r = s.rps;
+  const set = (big, sub) => o.innerHTML =
+    `<div class="big">${big}</div>` + (sub ? `<div class="sub">${sub}</div>` : "");
+
+  if (r.phase === "countdown") set(r.countdown, "Get ready...");
+  else if (r.phase === "capture") set("SHOOT!", "Robot: " + ICON[r.robot_move]);
+  else if (r.phase === "result") {
+    const cls = r.result === "void" ? "draw" : r.result;
+    o.classList.add(cls);
+    const big = { win: "YOU WIN", lose: "YOU LOSE", draw: "DRAW", void: "NO READ" }[r.result];
+    const sub = r.player_move
+      ? `You: ${ICON[r.player_move]} &nbsp;|&nbsp; Robot: ${ICON[r.robot_move]}`
+      : r.message;
+    set(big, sub);
+  }
+}
+
+function render(s) {
+  $("pill-hand").textContent = s.hand_detected ? "hand detected" : "no hand";
+  $("pill-hand").classList.toggle("on", s.hand_detected);
+  $("pill-serial").textContent = s.serial ? "robot: connected" : "robot: not connected";
+  $("pill-serial").classList.toggle("on", s.serial);
+  $("pill-fps").textContent = s.fps + " fps";
+  $("status").textContent = s.status;
+
+  $("mode-follow").classList.toggle("active", s.mode === "follow");
+  $("mode-rps").classList.toggle("active", s.mode === "rps");
+  $("rps-panel").classList.toggle("hidden", s.mode !== "rps");
+
+  const c = s.calibration, busy = c.capturing !== null;
+  const calibrated = c.open && c.closed;
+  $("cal-open").disabled = busy;
+  $("cal-closed").disabled = busy || !c.open;
+  $("cal-status").textContent = busy
+    ? `Capturing ${c.capturing}: ${c.progress}/30 - hold still`
+    : `Open: ${c.open ? "saved" : "not set"} | Fist: ${c.closed ? "saved" : "not set"}`;
+
+  const r = s.rps;
+  $("rps-start").disabled = !calibrated || r.phase === "countdown" || r.phase === "capture";
+  $("s-win").textContent = r.score.win;
+  $("s-lose").textContent = r.score.lose;
+  $("s-draw").textContent = r.score.draw;
+  renderOverlay(s);
+
+  fingersBody.innerHTML = s.fingers.map(f => `
+    <tr>
+      <td>${f.name}</td>
+      <td>${f.measured === null ? "--" : f.measured + "%"}
+          <div class="bar"><i style="width:${f.measured || 0}%"></i></div></td>
+      <td>${f.command === null ? "--" : f.command + "%"}</td>
+      <td>${f.state}</td>
+    </tr>`).join("");
+
+  if (!lmBuilt) {
+    lmBody.innerHTML = s.landmark_names.map((n, i) =>
+      `<tr><td>${i}</td><td>${n}</td><td></td><td></td><td></td></tr>`).join("");
+    lmBuilt = true;
+  }
+  [...lmBody.rows].forEach((row, i) => {
+    const p = s.landmarks ? s.landmarks[i] : null;
+    for (let k = 0; k < 3; k++)
+      row.cells[2 + k].textContent = p ? p[k].toFixed(3) : "--";
+  });
+}
+
+async function poll() {
+  try {
+    const r = await fetch("/api/state");
+    render(await r.json());
+  } catch (e) { $("status").textContent = "Lost connection to server..."; }
+  setTimeout(poll, 100);
+}
+poll();
+</script>
+</body>
+</html>
