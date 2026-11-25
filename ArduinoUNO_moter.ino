@@ -1,3 +1,6 @@
+# 실행된 mediapipe 통한 굽힘률을 이용하여 모터 제어하는 UNO 코드
+# 제어 값 0일때 100일때 값 수정 필요할 수도 있음. (배열)
+  
 #include <Arduino.h>
 #include <Wire.h>
 #include <Adafruit_PWMServoDriver.h>
