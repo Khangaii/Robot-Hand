@@ -1,3 +1,8 @@
+# 수정된 mediapipe % 굽힘률 표시 code
+# 현재 -> 0%, 50%, 100% 3단계로 나눔
+# 0%~20% : 0% / 40% ~ 60% : 50% / 70% ~ 100% : 100%
+#  수정 필요 부분 : 엄지 손가락 -> 1. 펴져 있어도 0% 측정되지 않음. 2. 1번째 관절을 굽혀야 100%으로 측정됨.
+
 """Preview: python camera_hand_mid50_v1.py; USB: add --port COM11 (actual port)."""
 import argparse
 from collections import deque
