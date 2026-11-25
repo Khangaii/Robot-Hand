@@ -1,3 +1,5 @@
+# visual studio 에서 직접 실행하는 code
+# python "camera_hand_mid50_v1.py" --port COM11 -> 아두이노 연결 후 port 값 수정하면 카메라 열리면서 mediapipe 실행됨.
 import time
 from pathlib import Path
 
