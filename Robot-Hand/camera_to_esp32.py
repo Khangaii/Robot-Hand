@@ -1,4 +1,5 @@
-﻿"""Preview: python camera_to_esp32.py; USB: add --port COM7 (your actual port)."""
+# 수정 전 mediapipe 굽힘률 표시 code -> 초기 code
+"""Preview: python camera_to_esp32.py; USB: add --port COM7 (your actual port)."""
 import argparse
 from collections import deque
 import math
