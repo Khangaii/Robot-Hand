@@ -28,13 +28,13 @@ from flask import Flask, Response, jsonify, request
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
-# Reuse the existing, already-tuned finger logic.
-from hand_detect import (
+import finger_tuning
+
+# Reuse the existing, already-tuned stabilizer / skeleton drawing.
+from camera_hand_mid50_v2 import (
     CONNECTIONS,
     NAMES,
     BendStabilizer,
-    bend_scores,
-    percentages,
 )
 
 HERE = Path(__file__).resolve().parent
@@ -203,35 +203,28 @@ class Engine:
         self.rps = RockPaperScissors()
         self.stabilizer = BendStabilizer()
 
-        self.opened = self.closed = None
-        self.capture = None
+        self.capture = None            # open | closed | finger_open | finger_closed
+        self.capture_finger = None
         self.samples = []
-        self.last_raw = None
+        self.last_feats = None
         self.calib_file = HERE / "calibration.json"
-        self._load_calibration()
+        self.tuning_file = HERE / "finger_tuning.json"
+        self.tuning = finger_tuning.load_settings(self.tuning_file)
+        self.cal_open, self.cal_closed = finger_tuning.load_calibration(
+            self.calib_file)
 
         self.state = {}
         self.fps = 0.0
         self._last_sent = 0.0
         self._reply_buffer = ""
 
-    # ---- calibration persistence
-    def _load_calibration(self):
-        try:
-            data = json.loads(self.calib_file.read_text())
-            self.opened = np.array(data["open"], dtype=float)
-            self.closed = np.array(data["closed"], dtype=float)
-        except Exception:
-            self.opened = self.closed = None
+    # ---- calibration
+    def _calibrated(self):
+        return self.cal_open is not None and self.cal_closed is not None
 
     def _save_calibration(self):
-        try:
-            self.calib_file.write_text(json.dumps({
-                "open": self.opened.tolist(),
-                "closed": self.closed.tolist(),
-            }))
-        except Exception as e:
-            print("Could not save calibration:", e)
+        finger_tuning.save_calibration(
+            self.calib_file, self.cal_open, self.cal_closed)
 
     # ---- commands from the web UI
     def set_mode(self, mode):
@@ -248,72 +241,130 @@ class Engine:
         with self.lock:
             if self.mode != "rps":
                 return False, "Switch to Rock Paper Scissors mode first."
-            if self.opened is None or self.closed is None:
+            if not self._calibrated():
                 return False, "Calibrate OPEN and FIST first."
             if not self.rps.start(time.monotonic()):
                 return False, "A round is already in progress."
         return True, ""
 
-    def start_calibration(self, pose):
+    def start_calibration(self, pose, finger=None):
         with self.lock:
-            if self.last_raw is None:
+            if self.last_feats is None:
                 return False, "Show your hand to the camera first."
             if pose == "open":
-                self.capture = "open"
-                self.opened = self.closed = None
+                self.cal_open = self.cal_closed = None
             elif pose == "closed":
-                if self.opened is None:
+                if self.cal_open is None:
                     return False, "Calibrate OPEN first."
-                self.capture = "closed"
-                self.closed = None
+                self.cal_closed = None
+            elif pose in ("finger_open", "finger_closed"):
+                if not self._calibrated():
+                    return False, "Calibrate OPEN and FIST first."
+                if finger not in finger_tuning.FINGER_NAMES:
+                    return False, "Unknown finger"
+                self.capture_finger = finger
             else:
                 return False, "Unknown pose"
+            self.capture = pose
             self.samples.clear()
             self.stabilizer.reset()
         return True, ""
 
+    # ---- live finger tuning
+    def update_tuning(self, finger, data, save=False):
+        with self.lock:
+            if finger not in self.tuning:
+                return False, "Unknown finger"
+            self.tuning[finger] = finger_tuning.sanitize_finger(
+                finger, data, self.tuning[finger])
+            if save:
+                finger_tuning.save_settings(self.tuning_file, self.tuning)
+        return True, ""
+
+    def apply_preset(self, finger, preset_id):
+        with self.lock:
+            if finger not in self.tuning:
+                return False, "Unknown finger"
+            new = finger_tuning.apply_preset(
+                finger, preset_id, self.tuning[finger])
+            if new is None:
+                return False, "Unknown preset"
+            self.tuning[finger] = new
+            finger_tuning.save_settings(self.tuning_file, self.tuning)
+        return True, ""
+
+    def reset_finger(self, finger):
+        with self.lock:
+            if finger not in self.tuning:
+                return False, "Unknown finger"
+            self.tuning[finger] = finger_tuning.original_finger(finger)
+            finger_tuning.save_settings(self.tuning_file, self.tuning)
+        return True, ""
+
     # ---- per-frame processing (called with lock held)
-    def _process(self, raw, landmarks, now):
-        self.last_raw = raw
+    def _process(self, feats, landmarks, now):
+        self.last_feats = feats
         status = "Show ONE hand to the camera."
         measured = values = None
 
         if self.capture is not None:
-            if raw is None:
+            if feats is None:
                 self.samples.clear()
             else:
-                self.samples.append(raw.copy())
-            status = f"Hold {self.capture.upper()} pose: {len(self.samples)}/30"
+                self.samples.append(finger_tuning.hand_vector(feats))
+            label = self.capture.replace("finger_", self.capture_finger + " "
+                                         if self.capture_finger else "")
+            status = f"Hold {label.upper()} pose: {len(self.samples)}/30"
             if len(self.samples) >= 30:
-                average = np.median(self.samples, axis=0)
+                avg = finger_tuning.split_vector(
+                    np.median(self.samples, axis=0))
+                f = self.capture_finger
                 if self.capture == "open":
-                    self.opened = average
-                    status = "OPEN saved. Now make a fist and press Calibrate FIST."
-                else:
-                    self.closed = average
+                    self.cal_open = avg
+                    status = ("OPEN saved. Now make a fist and press "
+                              "Calibrate FIST.")
+                elif self.capture == "closed":
+                    self.cal_closed = avg
                     self._save_calibration()
                     status = "FIST saved."
+                elif self.capture == "finger_open":
+                    self.cal_open[f] = avg[f]
+                    self._save_calibration()
+                    status = f"{f} OPEN saved."
+                else:
+                    self.cal_closed[f] = avg[f]
+                    self._save_calibration()
+                    status = f"{f} FIST saved."
                 self.capture = None
                 self.samples.clear()
 
-        calibrated = self.opened is not None and self.closed is not None
+        calibrated = self._calibrated()
+        tuning = {}
+        for n in NAMES:
+            tuning[n] = finger_tuning.compute(
+                n,
+                None if feats is None else feats[n],
+                self.cal_open[n] if calibrated else None,
+                self.cal_closed[n] if calibrated else None,
+                self.tuning[n])
 
-        if raw is not None and calibrated and self.capture is None:
-            try:
-                measured = percentages(raw, self.opened, self.closed)
+        if feats is not None and calibrated and self.capture is None:
+            outputs = [tuning[n]["output"] for n in NAMES]
+            if None in outputs:
+                bad = [n for n, o in zip(NAMES, outputs) if o is None]
+                status = ("No usable signal for " + ", ".join(bad) +
+                          ". Raise a weight or recapture OPEN/FIST.")
+                self.stabilizer.reset()
+            else:
+                measured = np.array(outputs)
                 values = self.stabilizer.update(measured, now)
                 status = "Ready."
-            except ValueError:
-                bad = [NAMES[i] for i in range(5)
-                       if abs(self.closed[i] - self.opened[i]) < 12]
-                status = "Recalibrate: too little change in " + ", ".join(bad)
-                self.stabilizer.reset()
         else:
             self.stabilizer.reset()
             if self.capture is None:
                 if not calibrated:
                     status = "Calibrate OPEN, then FIST."
-                elif raw is None:
+                elif feats is None:
                     status = "NO HAND - output stopped."
 
         # Decide what the robot should do.
@@ -321,10 +372,7 @@ class Engine:
             command = values              # None -> STOP
         else:
             gesture = classify(measured)
-            if calibrated:
-                command = self.rps.step(now, gesture)
-            else:
-                command = None
+            command = self.rps.step(now, gesture) if calibrated else None
 
         m_list = None if measured is None else [float(v) for v in measured]
         fingers = []
@@ -346,12 +394,26 @@ class Engine:
             "fps": round(self.fps, 1),
             "serial": self.link is not None,
             "calibration": {
-                "open": self.opened is not None,
-                "closed": self.closed is not None,
+                "open": self.cal_open is not None,
+                "closed": calibrated,
                 "capturing": self.capture,
+                "finger": self.capture_finger,
                 "progress": len(self.samples),
             },
             "fingers": fingers,
+            "tuning": {
+                "fingers": {n: {
+                    "settings": self.tuning[n],
+                    "features": tuning[n]["features"],
+                    "base": tuning[n]["base"],
+                    "output": (None if tuning[n]["output"] is None
+                               else round(tuning[n]["output"], 1)),
+                } for n in NAMES},
+                "presets": {
+                    "thumb": finger_tuning.preset_list("Thumb"),
+                    "finger": finger_tuning.preset_list("Index"),
+                },
+            },
             "landmarks": None if landmarks is None else [
                 [round(v, 3) for v in p] for p in landmarks
             ],
@@ -404,7 +466,7 @@ class Engine:
                         mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb),
                         ts)
 
-                    raw = landmarks = None
+                    feats = landmarks = None
                     h, w = frame.shape[:2]
                     if result.hand_landmarks and result.hand_world_landmarks:
                         pts = result.hand_landmarks[0]
@@ -416,11 +478,11 @@ class Engine:
                         for p in pixels:
                             cv2.circle(frame, p, 4, (0, 0, 255), -1)
                         try:
-                            raw = bend_scores([
-                                (p.x, p.y, p.z)
-                                for p in result.hand_world_landmarks[0]])
+                            feats = finger_tuning.hand_features(
+                                [(p.x, p.y, p.z)
+                                 for p in result.hand_world_landmarks[0]])
                         except ValueError:
-                            raw = None
+                            feats = None
 
                     now = time.monotonic()
                     dt = now - prev
@@ -429,7 +491,7 @@ class Engine:
                         self.fps = 0.9 * self.fps + 0.1 / dt
 
                     with self.lock:
-                        command = self._process(raw, landmarks, now)
+                        command = self._process(feats, landmarks, now)
                     self._send(command, now)
 
                     ok, buf = cv2.imencode(
@@ -502,13 +564,34 @@ def api_mode():
 
 @app.route("/api/calibrate", methods=["POST"])
 def api_calibrate():
-    return reply(engine.start_calibration(
-        (request.get_json(silent=True) or {}).get("pose")))
+    body = request.get_json(silent=True) or {}
+    return reply(engine.start_calibration(body.get("pose"),
+                                          body.get("finger")))
 
 
 @app.route("/api/rps/start", methods=["POST"])
 def api_rps_start():
     return reply(engine.start_round())
+
+
+@app.route("/api/tuning", methods=["POST"])
+def api_tuning():
+    body = request.get_json(silent=True) or {}
+    return reply(engine.update_tuning(body.get("finger"),
+                                      body.get("settings"),
+                                      bool(body.get("save"))))
+
+
+@app.route("/api/tuning/preset", methods=["POST"])
+def api_tuning_preset():
+    body = request.get_json(silent=True) or {}
+    return reply(engine.apply_preset(body.get("finger"), body.get("id")))
+
+
+@app.route("/api/tuning/reset", methods=["POST"])
+def api_tuning_reset():
+    return reply(engine.reset_finger(
+        (request.get_json(silent=True) or {}).get("finger")))
 
 
 def main():

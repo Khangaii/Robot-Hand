@@ -1,10 +1,12 @@
 """D3-G hand tracking. Preview: python d3g_bend.py; USB: add --port COM11 (actual port).
 
-No calibration happens on the board. The open/fist calibration
-(calibration.json) and the per-finger signal blend (finger_tuning.json) are
-made on the laptop with the web UI (app.py) and copied here, beside this file.
+Keys: O open-hand calibration | C fist calibration | ESC quit.
+Calibration is for the whole hand only (saved to calibration.json here).
+How each finger is computed comes from finger_tuning.json, made on the
+laptop with the web UI (app.py); see finger_tuning.py.
 """
 import argparse
+import sys
 from collections import deque
 import math
 from statistics import median
@@ -16,9 +18,16 @@ from camera import open_camera
 import cv2
 import mediapipe as mp
 import numpy as np
-import finger_tuning
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
+
+HERE = Path(__file__).resolve().parent
+# finger_tuning.py may sit beside this file or in the repo root.
+for _dir in (HERE, HERE.parent):
+    if (_dir / "finger_tuning.py").is_file():
+        sys.path.insert(0, str(_dir))
+        break
+import finger_tuning  # noqa: E402
 
 NAMES = ("Thumb", "Index", "Middle", "Ring", "Pinky")
 CHAINS = ((0, 1, 2, 3, 4), (0, 5, 6, 7, 8), (0, 9, 10, 11, 12),
@@ -119,31 +128,52 @@ class BendStabilizer:
         self.output = command
         return command.copy()
 
-HERE = Path(__file__).resolve().parent
+
+# Legacy single-angle helpers. Not used by main() any more; kept in case
+# other scripts (e.g. d3g_rps.py) import them from this file.
+def bend_scores(points):
+    points = np.asarray(points, dtype=float)
+    if points.shape != (21, 3) or not np.isfinite(points).all():
+        raise ValueError("Invalid landmarks")
+
+    scores = []
+    for finger_index, chain in enumerate(CHAINS):
+        if finger_index == 0:
+            # Thumb: MCP -> IP -> tip
+            # Measure bending at the IP joint.
+            chain = (2, 3, 4)
+        else:
+            chain = chain[1:4]
+
+        segments = np.diff(points[list(chain)], axis=0)
+        lengths = np.linalg.norm(segments, axis=1)
+        if np.any(lengths < 1e-8):
+            raise ValueError("Degenerate landmarks")
+
+        unit = segments / lengths[:, None]
+        cosines = np.clip(
+            np.sum(unit[:-1] * unit[1:], axis=1), -1, 1
+        )
+        scores.append(np.degrees(np.arccos(cosines)).mean())
+
+    return np.array(scores)
 
 
-def load_setup(calib_path, tuning_path):
-    """Load laptop-made calibration + tuning; fail early with a clear reason."""
-    cal_open, cal_closed = finger_tuning.load_calibration(calib_path)
-    if cal_open is None:
-        raise FileNotFoundError(
-            f"No valid calibration at {calib_path}. Calibrate on the laptop "
-            "(python app.py) and copy calibration.json here. Files from the "
-            "old calibration format will not work; redo it with the new app.")
-    if tuning_path.is_file():
-        settings = finger_tuning.load_settings(tuning_path)
-        print(f"Tuning: {tuning_path.name}")
-    else:
-        settings = finger_tuning.default_settings()
-        print(f"Tuning: {tuning_path.name} not found - using built-in defaults "
-              "(tuned thumb, original PIP-only for the other fingers).")
-    bad = [n for n in NAMES
-           if finger_tuning.compute(n, cal_closed[n], cal_open[n],
-                                    cal_closed[n], settings[n])["output"] is None]
-    if bad:
-        raise RuntimeError("No usable signal for: " + ", ".join(bad) +
-                           ". Recalibrate on the laptop or adjust the weights.")
-    return cal_open, cal_closed, settings
+def percentages(raw, opened, closed):
+    span = np.asarray(closed) - np.asarray(opened)
+    if not np.isfinite(span).all() or np.any(np.abs(span) < 12):
+        raise ValueError("Open/closed calibration too similar")
+    return np.clip((np.asarray(raw) - opened) / span * 100, 0, 100)
+
+
+
+def find_tuning_file():
+    """finger_tuning.json beside this file, else in the repo root, else None."""
+    for directory in (HERE, HERE.parent):
+        path = directory / "finger_tuning.json"
+        if path.is_file():
+            return path
+    return None
 
 
 def main():
@@ -151,9 +181,17 @@ def main():
     parser.add_argument("--port", help="Actual Arduino/ESP32 COM port; omit for camera preview")
     parser.add_argument("--camera", type=int, default=0)
     parser.add_argument("--calibration", type=Path, default=HERE / "calibration.json")
-    parser.add_argument("--tuning", type=Path, default=HERE / "finger_tuning.json")
+    parser.add_argument("--tuning", type=Path, default=None,
+                        help="finger_tuning.json (default: beside this file, else repo root)")
     args = parser.parse_args()
-    cal_open, cal_closed, settings = load_setup(args.calibration, args.tuning)
+    tuning_file = args.tuning or find_tuning_file()
+    if tuning_file is not None and tuning_file.is_file():
+        settings = finger_tuning.load_settings(tuning_file)
+        print(f"Tuning: {tuning_file}")
+    else:
+        settings = finger_tuning.default_settings()
+        print("Tuning: finger_tuning.json not found - using built-in defaults "
+              "(tuned thumb, original PIP-only for the other fingers).")
     model = Path(__file__).resolve().with_name("hand_landmarker.task")
     if not model.is_file():
         alternative = model.with_name("hand_landmarker(1).task")
@@ -173,12 +211,18 @@ def main():
             link = serial.Serial(args.port, 115200, timeout=0, write_timeout=0.3)
             time.sleep(2)  # USB opening may reset the board.
             link.reset_input_buffer()
+        cal_open, cal_closed = finger_tuning.load_calibration(args.calibration)
         stabilizer = BendStabilizer()
+        capture = None
+        samples = []
         last_timestamp = -1
         last_sent = 0.0
         reply_buffer = ""
-        status = "Show ONE hand (the calibrated hand)."
-        print("Using saved calibration. ESC: quit.")
+        if cal_open is not None:
+            status = "Loaded saved calibration. Press O / C to redo."
+        else:
+            status = "Show ONE hand. Press O with all fingers OPEN."
+        print("Use the SAME hand. O: open calibration; C: fist calibration; ESC: quit.")
         with vision.HandLandmarker.create_from_options(options) as detector:
             while True:
                 ok, frame = cap.read()
@@ -204,14 +248,39 @@ def main():
                             [(p.x, p.y, p.z) for p in result.hand_world_landmarks[0]])
                     except ValueError:
                         feats = None
-                if feats is not None:
-                    measured = np.array([finger_tuning.compute(
+                if capture is not None:
+                    if feats is None:
+                        samples.clear()  # Require consecutive visible-hand frames.
+                    else:
+                        samples.append(finger_tuning.hand_vector(feats))
+                    status = f"Hold {capture.upper()} pose: {len(samples)}/30"
+                    if len(samples) == 30:
+                        average = finger_tuning.split_vector(np.median(samples, axis=0))
+                        if capture == "open":
+                            cal_open, cal_closed = average, None
+                            status = "OPEN saved. Make a fist, then press C."
+                        else:
+                            cal_closed = average
+                            finger_tuning.save_calibration(args.calibration, cal_open, cal_closed)
+                            status = "CLOSED saved."
+                        capture = None
+                        samples.clear()
+                calibrated = cal_open is not None and cal_closed is not None
+                if feats is not None and calibrated and capture is None:
+                    outputs = [finger_tuning.compute(
                         n, feats[n], cal_open[n], cal_closed[n], settings[n])["output"]
-                        for n in NAMES])
-                    values = stabilizer.update(measured, time.monotonic())
-                    status = "READY: sending commands." if link else "READY: preview only."
+                        for n in NAMES]
+                    if None in outputs:
+                        bad = [n for n, o in zip(NAMES, outputs) if o is None]
+                        status = "Redo O/C or change weights: no usable signal: " + ",".join(bad)
+                        stabilizer.reset()
+                    else:
+                        measured = np.array(outputs)
+                        values = stabilizer.update(measured, time.monotonic())
+                        status = "READY: sending commands." if link else "READY: preview only."
                 else:
                     stabilizer.reset()
+                if feats is None:
                     status = "NO HAND - output stopped. Show the same hand."
                 now = time.monotonic()
                 if link and now - last_sent >= 0.05:
@@ -225,7 +294,7 @@ def main():
                         print("Board:", line.strip())
                     reply_buffer = reply_buffer[-4096:]
                 panel = np.zeros((310, w, 3), dtype=np.uint8)
-                cv2.putText(panel, "Saved calibration | ESC: quit", (10, 25),
+                cv2.putText(panel, "O: OPEN | C: FIST | ESC: quit", (10, 25),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
                 cv2.putText(panel, status, (10, 50), cv2.FONT_HERSHEY_SIMPLEX,
                             0.42, (0, 220, 255), 1)
@@ -252,8 +321,25 @@ def main():
                 cv2.putText(panel, "States confirmed after 0.12s; outside zones: tracking.",
                             (10, 297), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (255, 255, 255), 1)
                 cv2.imshow("Robot Hand - D3-G", np.vstack((frame, panel)))
-                if cv2.waitKey(1) & 0xFF == 27:
+                key = cv2.waitKey(1) & 0xFF
+                if key == 27:
                     break
+
+                if key in (ord("o"), ord("O"), ord("c"), ord("C")):
+                    if feats is None:
+                        print("Show the same hand before calibration.")
+                        continue
+                    if key in (ord("o"), ord("O")):
+                        capture = "open"
+                        cal_open = cal_closed = None  # Begin a fresh calibration pair.
+                    elif cal_open is not None:
+                        capture = "closed"
+                        cal_closed = None
+                    else:
+                        print("Press O with an open hand FIRST.")
+                        continue
+                    samples.clear()
+                    stabilizer.reset()
     finally:
         cap.release()
         cv2.destroyAllWindows()
