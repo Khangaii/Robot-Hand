@@ -1,0 +1,63 @@
+{
+  "Thumb": {
+    "weights": {
+      "ip": 50.0,
+      "mcp": 100.0,
+      "cmc": 0.0,
+      "spread": 0.0,
+      "tip_index": 20.0,
+      "tip_pinky": 75.0
+    },
+    "lo": 10.0,
+    "hi": 80.0,
+    "gamma": 1.0
+  },
+  "Index": {
+    "weights": {
+      "pip": 50.0,
+      "dip": 0,
+      "mcp": 50.0,
+      "tip_wrist": 50.0,
+      "tip_base": 50.0
+    },
+    "lo": 10.0,
+    "hi": 75.0,
+    "gamma": 0.5
+  },
+  "Middle": {
+    "weights": {
+      "pip": 100.0,
+      "dip": 0.0,
+      "mcp": 0.0,
+      "tip_wrist": 0.0,
+      "tip_base": 0.0
+    },
+    "lo": 0.0,
+    "hi": 100.0,
+    "gamma": 1.0
+  },
+  "Ring": {
+    "weights": {
+      "pip": 100.0,
+      "dip": 0.0,
+      "mcp": 0.0,
+      "tip_wrist": 0.0,
+      "tip_base": 0.0
+    },
+    "lo": 0.0,
+    "hi": 100.0,
+    "gamma": 1.0
+  },
+  "Pinky": {
+    "weights": {
+      "pip": 100.0,
+      "dip": 0.0,
+      "mcp": 0.0,
+      "tip_wrist": 0.0,
+      "tip_base": 0.0
+    },
+    "lo": 0.0,
+    "hi": 100.0,
+    "gamma": 1.0
+  }
+}

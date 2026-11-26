@@ -1,0 +1,13 @@
+{
+  "weights": {
+    "ip": 50.0,
+    "mcp": 100,
+    "cmc": 0,
+    "spread": 0,
+    "tip_index": 20.0,
+    "tip_pinky": 75.0
+  },
+  "lo": 10.0,
+  "hi": 80.0,
+  "gamma": 1.0
+}
