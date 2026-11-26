@@ -1,5 +1,6 @@
-"""Preview: python camera_hand_mid50_v1.py; USB: add --port COM11 (actual port)."""
+"""Hand-tracking helpers for huang_live.py (stabilizer, skeleton, finger tuning)."""
 import argparse
+import sys
 from collections import deque
 import math
 from statistics import median
@@ -11,6 +12,14 @@ import mediapipe as mp
 import numpy as np
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
+
+HERE = Path(__file__).resolve().parent
+# finger_tuning.py may sit beside this file or in the folder above it.
+for _dir in (HERE, HERE.parent):
+    if (_dir / "finger_tuning.py").is_file():
+        sys.path.insert(0, str(_dir))
+        break
+import finger_tuning  # noqa: E402
 
 NAMES = ("Thumb", "Index", "Middle", "Ring", "Pinky")
 CHAINS = ((0, 1, 2, 3, 4), (0, 5, 6, 7, 8), (0, 9, 10, 11, 12),
@@ -112,6 +121,8 @@ class BendStabilizer:
         return command.copy()
 
 
+# Legacy single-angle helpers. huang_live.py no longer uses them; kept in case
+# something else imports them from this file.
 def bend_scores(points):
     points = np.asarray(points, dtype=float)
     if points.shape != (21, 3) or not np.isfinite(points).all():
@@ -147,4 +158,15 @@ def percentages(raw, opened, closed):
     return np.clip((np.asarray(raw) - opened) / span * 100, 0, 100)
 
 
-
+def load_tuning(path=None):
+    """Per-finger settings from finger_tuning.json (beside this file, else the
+    folder above it). Falls back to built-in defaults if there is none."""
+    if path is None:
+        path = next((d / "finger_tuning.json" for d in (HERE, HERE.parent)
+                     if (d / "finger_tuning.json").is_file()), None)
+    if path is not None and Path(path).is_file():
+        print(f"Tuning: {path}")
+        return finger_tuning.load_settings(Path(path))
+    print("Tuning: finger_tuning.json not found - using built-in defaults "
+          "(tuned thumb, original PIP-only for the other fingers).")
+    return finger_tuning.default_settings()

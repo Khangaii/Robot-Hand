@@ -1,4 +1,8 @@
-"""Run beside the working d3g_bend.py in its existing Python environment."""
+"""Run beside the working d3g_bend.py in its existing Python environment.
+
+Finger tracking uses finger_tuning.py / finger_tuning.json (see tracking.py).
+Calibration is still the whole-hand O (open) and C (fist) only.
+"""
 import argparse
 from pathlib import Path
 import time
@@ -6,8 +10,8 @@ import re
 import subprocess
 from huang_input import ModeSwitch
 
-from tracking import (BendStabilizer, CONNECTIONS, bend_scores, cv2, mp,
-                      np, percentages, python, vision)
+from tracking import (BendStabilizer, CONNECTIONS, NAMES, cv2, finger_tuning,
+                      load_tuning, mp, np, python, vision)
 from huang_ui import FollowScreen, instruction
 
 
@@ -17,6 +21,8 @@ def main():
     parser.add_argument("--camera", type=int, default=0)
     parser.add_argument("--switch", nargs=2, metavar=("GPIOCHIP", "OFFSET"))
     parser.add_argument("--board", action="store_true", help="D3-G camera and Windows game host")
+    parser.add_argument("--tuning", type=Path, default=None,
+                        help="finger_tuning.json (default: beside tracking.py, else the folder above)")
     args = parser.parse_args()
     if args.switch:
         try:
@@ -25,6 +31,7 @@ def main():
                 raise ValueError
         except ValueError:
             parser.error("OFFSET must be a nonnegative GPIO line offset")
+    settings = load_tuning(args.tuning)
     if args.board:
         from camera import open_camera
         from game_link import Client
@@ -87,7 +94,7 @@ def main():
             link = serial.Serial(args.port, 115200, timeout=0, write_timeout=0.3)
             time.sleep(2)  # USB opening may reset the board.
             link.reset_input_buffer()
-        opened = closed = None
+        cal_open = cal_closed = None
         stabilizer = BendStabilizer()
         capture = None
         samples = []
@@ -112,7 +119,7 @@ def main():
                 last_timestamp = timestamp
                 result = detector.detect_for_video(
                     mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb), timestamp)
-                raw = measured = values = None
+                feats = measured = values = None
                 h, w = frame.shape[:2]
                 if result.hand_landmarks and result.hand_world_landmarks:
                     pixels = [(int(p.x * w), int(p.y * h))
@@ -122,29 +129,33 @@ def main():
                     for p in pixels:
                         cv2.circle(frame, p, 4, (0, 0, 255), -1)
                     try:
-                        raw = bend_scores([(p.x, p.y, p.z)
-                                           for p in result.hand_world_landmarks[0]])
+                        feats = finger_tuning.hand_features(
+                            [(p.x, p.y, p.z) for p in result.hand_world_landmarks[0]])
                     except ValueError:
-                        raw = None
+                        feats = None
                 if capture is not None:
-                    if raw is None:
+                    if feats is None:
                         samples.clear()  # Require consecutive visible-hand frames.
                     else:
-                        samples.append(raw.copy())
+                        samples.append(finger_tuning.hand_vector(feats))
                     if len(samples) == 30:
-                        average = np.median(samples, axis=0)
+                        average = finger_tuning.split_vector(np.median(samples, axis=0))
                         if capture == "open":
-                            opened = average
+                            cal_open = average
                         else:
-                            closed = average
+                            cal_closed = average
                         capture = None
                         samples.clear()
-                if raw is not None and opened is not None and closed is not None and capture is None:
-                    try:
-                        measured = percentages(raw, opened, closed)
-                        values = stabilizer.update(measured, time.monotonic())
-                    except ValueError:
+                if (feats is not None and cal_open is not None and cal_closed is not None
+                        and capture is None):
+                    outputs = [finger_tuning.compute(
+                        n, feats[n], cal_open[n], cal_closed[n], settings[n])["output"]
+                        for n in NAMES]
+                    if None in outputs:  # no usable signal: the "redo" screen
                         stabilizer.reset()
+                    else:
+                        measured = np.array(outputs)
+                        values = stabilizer.update(measured, time.monotonic())
                 else:
                     stabilizer.reset()
                 now = time.monotonic()
@@ -159,8 +170,8 @@ def main():
                     last_sent = 0.0
                 output = values
                 if mode == "game":
-                    fingers = None if measured is None else measured[1:]
-                    reply = game.frame([now, acquired, None if fingers is None else fingers.tolist(), action, shown])
+                    fingers = None if measured is None else measured.tolist()  # thumb..pinky
+                    reply = game.frame([now, acquired, fingers, action, shown])
                     action = shown = None
                     state = reply["state"] if reply else "offline"
                     lines = reply["lines"] if reply else ["Waiting for PC", "Start pc_game.py"]
@@ -177,7 +188,7 @@ def main():
                         line, reply_buffer = reply_buffer.split("\n", 1)
                         print("Board:", line.strip())
                     reply_buffer = reply_buffer[-4096:]
-                hint = instruction(raw, opened, closed, capture, measured)
+                hint = instruction(feats, cal_open, cal_closed, capture, measured)
                 if mode == "game" and hint == "ready":
                     hint = {"ready": "game_ready", "result": "game_result"}.get(state, "game_throw")
                 canvas = screen.render(frame, values, hint, len(samples), stabilizer.state, mode)
@@ -203,7 +214,7 @@ def main():
                     if (key == 32 and mode == selected[0] and values is not None
                             and state in ("ready", "result")):
                         action = "start"
-                    if key in map(ord, "oOcC") and raw is not None:
+                    if key in map(ord, "oOcC") and feats is not None:
                         action = "reset"
                 if key in (ord("f"), ord("F")):
                     fullscreen = not fullscreen
@@ -216,26 +227,16 @@ def main():
                 if key == 27:
                     break
 
-                if key in (ord("t"), ord("T")):
-                    if raw is None or opened is None or closed is None or capture is not None:
-                        print("Finish O/C calibration and show your hand first.")
-                    elif abs(raw[0] - opened[0]) < 12:
-                        print("Thumb angle is too close to the O pose. Try T again.")
-                    else:
-                        closed[0] = raw[0]
-                        stabilizer.reset()
-                        print("Thumb 100% saved.")
-
                 if key in (ord("o"), ord("O"), ord("c"), ord("C")):
-                    if raw is None:
+                    if feats is None:
                         print("Show the same hand before calibration.")
                         continue
                     if key in (ord("o"), ord("O")):
                         capture = "open"
-                        opened = closed = None  # Begin a fresh calibration pair.
-                    elif opened is not None:
+                        cal_open = cal_closed = None  # Begin a fresh calibration pair.
+                    elif cal_open is not None:
                         capture = "closed"
-                        closed = None
+                        cal_closed = None
                     else:
                         print("Press O with an open hand FIRST.")
                         continue
