@@ -1,621 +1,250 @@
-"""
-Robot hand control UI (Flask).
+"""D3-G rock-paper-scissors. Run beside d3g_bend.py in its working environment.
 
-Run beside hand_detect.py and hand_landmarker.task:
-
-    python app.py                       # laptop webcam, no robot
-    python app.py --port COM5           # laptop webcam + Arduino
-    python app.py --source http://...   # network camera / stream URL
-    python app.py --host 0.0.0.0        # reachable from other machines
-
-Then open http://localhost:5000
+Uses the same finger tracking, calibration.json and finger_tuning.json as
+d3g_bend.py, so O / C calibration done in either program is shared.
 """
 import argparse
-import json
-import math
-import platform
-import random
-import sys
-import threading
-import time
 from collections import Counter
+import math
 from pathlib import Path
+import random
+import time
 
-import cv2
-import mediapipe as mp
-import numpy as np
-from flask import Flask, Response, jsonify, request
-from mediapipe.tasks import python
-from mediapipe.tasks.python import vision
-
-import finger_tuning
-
-# Reuse the existing, already-tuned stabilizer / skeleton drawing.
-from camera_hand_mid50_v2 import (
-    CONNECTIONS,
-    NAMES,
-    BendStabilizer,
-)
-
-HERE = Path(__file__).resolve().parent
-
-LANDMARK_NAMES = [
-    "Wrist",
-    "Thumb CMC", "Thumb MCP", "Thumb IP", "Thumb Tip",
-    "Index MCP", "Index PIP", "Index DIP", "Index Tip",
-    "Middle MCP", "Middle PIP", "Middle DIP", "Middle Tip",
-    "Ring MCP", "Ring PIP", "Ring DIP", "Ring Tip",
-    "Pinky MCP", "Pinky PIP", "Pinky DIP", "Pinky Tip",
-]
-
-# ---------------------------------------------------------------- RPS config
-COUNTDOWN_SECONDS = 3      # 3 -> 2 -> 1 -> reveal
-CAPTURE_DELAY = 0.30       # wait after reveal so the throw has settled...
-CAPTURE_SECONDS = 0.70     # ...then vote over this window
-MIN_VALID_FRAMES = 4       # need at least this many readable frames
-MIN_AGREEMENT = 0.60       # share of frames that must agree
-EXTENDED_BELOW = 45.0      # finger bend % under this counts as "extended"
-
-# Robot finger commands: 0 = open, 100 = closed (order: thumb..pinky)
+# Thumb, index, middle, ring, pinky. Percentages use the UNO's calibrated travel.
 POSES = {
-    "rock":     [100, 100, 100, 100, 100],
-    "paper":    [0, 0, 0, 0, 0],
-    "scissors": [100, 0, 0, 100, 100],
+    "ROCK": (100, 100, 100, 100, 100),
+    "PAPER": (0, 0, 0, 0, 0),
+    "SCISSORS": (100, 0, 0, 100, 100),
 }
-READY_POSE = POSES["rock"]
-BEATS = {"rock": "scissors", "scissors": "paper", "paper": "rock"}
+BEATS = {"ROCK": "SCISSORS", "PAPER": "ROCK", "SCISSORS": "PAPER"}
+PATTERNS = {tuple(v[1:]): k for k, v in POSES.items()}
 
 
-def classify(measured):
-    """Return rock / paper / scissors / None from bend percentages.
-    The thumb is ignored: it is the least reliable finger to read."""
-    if measured is None:
+def classify(values):
+    """values: bend % for thumb, index, middle, ring, pinky (or None)."""
+    if values is None:
         return None
-    idx, mid, ring, pinky = [m < EXTENDED_BELOW for m in measured[1:]]
-    if not (idx or mid or ring or pinky):
-        return "rock"
-    if idx and mid and ring and pinky:
-        return "paper"
-    if idx and mid and not ring and not pinky:
-        return "scissors"
+    # Index..pinky decide rock / paper / classic scissors; the thumb is ignored.
+    pattern = tuple(0 if v <= 30 else 100 if v >= 65 else None for v in values[1:])
+    label = PATTERNS.get(pattern)
+    if label:
+        return label
+    # Extended thumb + index with the other three curled also counts as scissors.
+    if values[0] <= 30 and pattern == (0, 100, 100, 100):
+        return "SCISSORS"
     return None
 
 
-class RockPaperScissors:
-    def __init__(self):
-        self.score = {"win": 0, "lose": 0, "draw": 0}
-        self.reset()
-
-    def reset(self):
-        self.phase = "idle"   # idle -> countdown -> capture -> result
-        self.t_start = self.t_reveal = None
-        self.robot = self.player = self.result = None
-        self.votes = []
-        self.message = "Press Start to play."
-
-    def start(self, now):
-        if self.phase in ("countdown", "capture"):
-            return False
-        self.reset()
-        self.phase = "countdown"
-        self.t_start = now
-        self.message = "Get ready..."
-        return True
-
-    def step(self, now, gesture):
-        """Advance the round; return the finger command for the robot."""
-        if self.phase == "countdown":
-            if now - self.t_start >= COUNTDOWN_SECONDS:
-                self.robot = random.choice(list(POSES))
-                self.t_reveal = now
-                self.phase = "capture"
-                self.message = "SHOOT!"
-
-        elif self.phase == "capture":
-            begin = self.t_reveal + CAPTURE_DELAY
-            if begin <= now <= begin + CAPTURE_SECONDS:
-                self.votes.append(gesture)
-            elif now > begin + CAPTURE_SECONDS:
-                self._resolve()
-
-        if self.phase in ("capture", "result") and self.robot:
-            return list(POSES[self.robot])
-        return list(READY_POSE)
-
-    def _resolve(self):
-        valid = [v for v in self.votes if v]
-        self.phase = "result"
-        if len(valid) >= MIN_VALID_FRAMES:
-            move, count = Counter(valid).most_common(1)[0]
-            if count / len(valid) >= MIN_AGREEMENT:
-                self.player = move
-                if move == self.robot:
-                    self.result = "draw"
-                elif BEATS[move] == self.robot:
-                    self.result = "win"
-                else:
-                    self.result = "lose"
-                self.score[self.result] += 1
-                self.message = {
-                    "win": "You win!", "lose": "You lose!", "draw": "Draw!",
-                }[self.result]
-                return
-        self.result = "void"
-        self.message = "Couldn't read your throw. Round not counted."
-
-    def snapshot(self, now):
-        number = None
-        if self.phase == "countdown":
-            remaining = COUNTDOWN_SECONDS - (now - self.t_start)
-            number = max(1, math.ceil(remaining))
-        show_robot = self.phase in ("capture", "result")
-        return {
-            "phase": self.phase,
-            "countdown": number,
-            "robot_move": self.robot if show_robot else None,
-            "player_move": self.player,
-            "result": self.result,
-            "message": self.message,
-            "score": dict(self.score),
-        }
-
-
-# -------------------------------------------------------------------- engine
-def open_capture(source):
-    if isinstance(source, int) and platform.system() == "Windows":
-        cap = cv2.VideoCapture(source, cv2.CAP_DSHOW)
-    else:
-        cap = cv2.VideoCapture(source)
-    if not cap.isOpened():
-        cap.release()
-        raise RuntimeError(f"Cannot open camera/source: {source!r}")
-    return cap
-
-
-def find_model():
-    for name in ("hand_landmarker.task", "hand_landmarker(1).task"):
-        path = HERE / name
-        if path.is_file():
-            return path
-    raise FileNotFoundError("Place hand_landmarker.task beside app.py.")
-
-
-class Engine:
-    def __init__(self, source, port=None):
-        self.cap = open_capture(source)
-        self.model = find_model()
-
-        self.link = None
-        if port:
-            import serial
-            self.link = serial.Serial(port, 115200, timeout=0,
-                                      write_timeout=0.3)
-            time.sleep(2)  # UNO may reset on connect
-            self.link.reset_input_buffer()
-
-        self.lock = threading.RLock()
-        self.frame_cond = threading.Condition()
-        self.jpeg = None
-        self.frame_id = 0
-        self.stop_event = threading.Event()
-
-        self.mode = "follow"          # "follow" | "rps"
-        self.rps = RockPaperScissors()
-        self.stabilizer = BendStabilizer()
-
-        self.capture = None            # open | closed | finger_open | finger_closed
-        self.capture_finger = None
-        self.samples = []
-        self.last_feats = None
-        self.calib_file = HERE / "calibration.json"
-        self.tuning_file = HERE / "finger_tuning.json"
-        self.tuning = finger_tuning.load_settings(self.tuning_file)
-        self.cal_open, self.cal_closed = finger_tuning.load_calibration(
-            self.calib_file)
-
-        self.state = {}
-        self.fps = 0.0
-        self._last_sent = 0.0
-        self._reply_buffer = ""
-
-    # ---- calibration
-    def _calibrated(self):
-        return self.cal_open is not None and self.cal_closed is not None
-
-    def _save_calibration(self):
-        finger_tuning.save_calibration(
-            self.calib_file, self.cal_open, self.cal_closed)
-
-    # ---- commands from the web UI
-    def set_mode(self, mode):
-        if mode not in ("follow", "rps"):
-            return False, "Unknown mode"
-        with self.lock:
-            if mode != self.mode:
-                self.mode = mode
-                self.rps.reset()
-                self.stabilizer.reset()
-        return True, ""
-
-    def start_round(self):
-        with self.lock:
-            if self.mode != "rps":
-                return False, "Switch to Rock Paper Scissors mode first."
-            if not self._calibrated():
-                return False, "Calibrate OPEN and FIST first."
-            if not self.rps.start(time.monotonic()):
-                return False, "A round is already in progress."
-        return True, ""
-
-    def start_calibration(self, pose, finger=None):
-        with self.lock:
-            if self.last_feats is None:
-                return False, "Show your hand to the camera first."
-            if pose == "open":
-                self.cal_open = self.cal_closed = None
-            elif pose == "closed":
-                if self.cal_open is None:
-                    return False, "Calibrate OPEN first."
-                self.cal_closed = None
-            elif pose in ("finger_open", "finger_closed"):
-                if not self._calibrated():
-                    return False, "Calibrate OPEN and FIST first."
-                if finger not in finger_tuning.FINGER_NAMES:
-                    return False, "Unknown finger"
-                self.capture_finger = finger
-            else:
-                return False, "Unknown pose"
-            self.capture = pose
-            self.samples.clear()
-            self.stabilizer.reset()
-        return True, ""
-
-    # ---- live finger tuning
-    def update_tuning(self, finger, data, save=False):
-        with self.lock:
-            if finger not in self.tuning:
-                return False, "Unknown finger"
-            self.tuning[finger] = finger_tuning.sanitize_finger(
-                finger, data, self.tuning[finger])
-            if save:
-                finger_tuning.save_settings(self.tuning_file, self.tuning)
-        return True, ""
-
-    def apply_preset(self, finger, preset_id):
-        with self.lock:
-            if finger not in self.tuning:
-                return False, "Unknown finger"
-            new = finger_tuning.apply_preset(
-                finger, preset_id, self.tuning[finger])
-            if new is None:
-                return False, "Unknown preset"
-            self.tuning[finger] = new
-            finger_tuning.save_settings(self.tuning_file, self.tuning)
-        return True, ""
-
-    def reset_finger(self, finger):
-        with self.lock:
-            if finger not in self.tuning:
-                return False, "Unknown finger"
-            self.tuning[finger] = finger_tuning.original_finger(finger)
-            finger_tuning.save_settings(self.tuning_file, self.tuning)
-        return True, ""
-
-    # ---- per-frame processing (called with lock held)
-    def _process(self, feats, landmarks, now):
-        self.last_feats = feats
-        status = "Show ONE hand to the camera."
-        measured = values = None
-
-        if self.capture is not None:
-            if feats is None:
-                self.samples.clear()
-            else:
-                self.samples.append(finger_tuning.hand_vector(feats))
-            label = self.capture.replace("finger_", self.capture_finger + " "
-                                         if self.capture_finger else "")
-            status = f"Hold {label.upper()} pose: {len(self.samples)}/30"
-            if len(self.samples) >= 30:
-                avg = finger_tuning.split_vector(
-                    np.median(self.samples, axis=0))
-                f = self.capture_finger
-                if self.capture == "open":
-                    self.cal_open = avg
-                    status = ("OPEN saved. Now make a fist and press "
-                              "Calibrate FIST.")
-                elif self.capture == "closed":
-                    self.cal_closed = avg
-                    self._save_calibration()
-                    status = "FIST saved."
-                elif self.capture == "finger_open":
-                    self.cal_open[f] = avg[f]
-                    self._save_calibration()
-                    status = f"{f} OPEN saved."
-                else:
-                    self.cal_closed[f] = avg[f]
-                    self._save_calibration()
-                    status = f"{f} FIST saved."
-                self.capture = None
-                self.samples.clear()
-
-        calibrated = self._calibrated()
-        tuning = {}
-        for n in NAMES:
-            tuning[n] = finger_tuning.compute(
-                n,
-                None if feats is None else feats[n],
-                self.cal_open[n] if calibrated else None,
-                self.cal_closed[n] if calibrated else None,
-                self.tuning[n])
-
-        if feats is not None and calibrated and self.capture is None:
-            outputs = [tuning[n]["output"] for n in NAMES]
-            if None in outputs:
-                bad = [n for n, o in zip(NAMES, outputs) if o is None]
-                status = ("No usable signal for " + ", ".join(bad) +
-                          ". Raise a weight or recapture OPEN/FIST.")
-                self.stabilizer.reset()
-            else:
-                measured = np.array(outputs)
-                values = self.stabilizer.update(measured, now)
-                status = "Ready."
-        else:
-            self.stabilizer.reset()
-            if self.capture is None:
-                if not calibrated:
-                    status = "Calibrate OPEN, then FIST."
-                elif feats is None:
-                    status = "NO HAND - output stopped."
-
-        # Decide what the robot should do.
-        if self.mode == "follow":
-            command = values              # None -> STOP
-        else:
-            gesture = classify(measured)
-            command = self.rps.step(now, gesture) if calibrated else None
-
-        m_list = None if measured is None else [float(v) for v in measured]
-        fingers = []
-        for i, name in enumerate(NAMES):
-            st = "-"
-            if self.mode == "follow" and values is not None:
-                st = self.stabilizer.state[i]
-            fingers.append({
-                "name": name,
-                "measured": None if m_list is None else round(m_list[i]),
-                "command": None if command is None else command[i],
-                "state": st,
-            })
-
-        self.state = {
-            "mode": self.mode,
-            "status": status,
-            "hand_detected": landmarks is not None,
-            "fps": round(self.fps, 1),
-            "serial": self.link is not None,
-            "calibration": {
-                "open": self.cal_open is not None,
-                "closed": calibrated,
-                "capturing": self.capture,
-                "finger": self.capture_finger,
-                "progress": len(self.samples),
-            },
-            "fingers": fingers,
-            "tuning": {
-                "fingers": {n: {
-                    "settings": self.tuning[n],
-                    "features": tuning[n]["features"],
-                    "base": tuning[n]["base"],
-                    "output": (None if tuning[n]["output"] is None
-                               else round(tuning[n]["output"], 1)),
-                } for n in NAMES},
-                "presets": {
-                    "thumb": finger_tuning.preset_list("Thumb"),
-                    "finger": finger_tuning.preset_list("Index"),
-                },
-            },
-            "landmarks": None if landmarks is None else [
-                [round(v, 3) for v in p] for p in landmarks
-            ],
-            "live_gesture": classify(m_list) if m_list else None,
-            "rps": self.rps.snapshot(now),
-        }
-        return command
-
-    # ---- robot serial link
-    def _send(self, command, now):
-        if not self.link:
-            return
-        if now - self._last_sent >= 0.05:
-            packet = "STOP" if command is None else ",".join(map(str, command))
-            self.link.write((packet + "\n").encode("ascii"))
-            self._last_sent = now
-        if self.link.in_waiting:
-            self._reply_buffer += self.link.read(
-                min(self.link.in_waiting, 4096)
-            ).decode("ascii", errors="replace")
-            while "\n" in self._reply_buffer:
-                line, self._reply_buffer = self._reply_buffer.split("\n", 1)
-                print("Board:", line.strip())
-            self._reply_buffer = self._reply_buffer[-4096:]
-
-    # ---- main loop
-    def run(self):
-        options = vision.HandLandmarkerOptions(
-            base_options=python.BaseOptions(
-                model_asset_buffer=self.model.read_bytes()),
-            running_mode=vision.RunningMode.VIDEO,
-            num_hands=1,
-        )
-        last_ts = -1
-        prev = time.monotonic()
-
-        try:
-            with vision.HandLandmarker.create_from_options(options) as det:
-                while not self.stop_event.is_set():
-                    ok, frame = self.cap.read()
-                    if not ok:
-                        time.sleep(0.05)
-                        continue
-
-                    frame = cv2.flip(frame, 1)
-                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    ts = max(time.monotonic_ns() // 1_000_000, last_ts + 1)
-                    last_ts = ts
-                    result = det.detect_for_video(
-                        mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb),
-                        ts)
-
-                    feats = landmarks = None
-                    h, w = frame.shape[:2]
-                    if result.hand_landmarks and result.hand_world_landmarks:
-                        pts = result.hand_landmarks[0]
-                        landmarks = [(p.x, p.y, p.z) for p in pts]
-                        pixels = [(int(p.x * w), int(p.y * h)) for p in pts]
-                        for a, b in CONNECTIONS:
-                            cv2.line(frame, pixels[a], pixels[b],
-                                     (0, 220, 0), 2)
-                        for p in pixels:
-                            cv2.circle(frame, p, 4, (0, 0, 255), -1)
-                        try:
-                            feats = finger_tuning.hand_features(
-                                [(p.x, p.y, p.z)
-                                 for p in result.hand_world_landmarks[0]])
-                        except ValueError:
-                            feats = None
-
-                    now = time.monotonic()
-                    dt = now - prev
-                    prev = now
-                    if dt > 0:
-                        self.fps = 0.9 * self.fps + 0.1 / dt
-
-                    with self.lock:
-                        command = self._process(feats, landmarks, now)
-                    self._send(command, now)
-
-                    ok, buf = cv2.imencode(
-                        ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                    if ok:
-                        with self.frame_cond:
-                            self.jpeg = buf.tobytes()
-                            self.frame_id += 1
-                            self.frame_cond.notify_all()
-        finally:
-            self.cap.release()
-            if self.link:
-                try:
-                    self.link.write(b"STOP\n")
-                finally:
-                    self.link.close()
-
-    def wait_frame(self, last_id, timeout=1.0):
-        with self.frame_cond:
-            self.frame_cond.wait_for(
-                lambda: self.frame_id != last_id, timeout=timeout)
-            return self.frame_id, self.jpeg
-
-    def snapshot(self):
-        with self.lock:
-            state = dict(self.state)
-            state["landmark_names"] = LANDMARK_NAMES
-            return state
-
-
-# ----------------------------------------------------------------- web app
-app = Flask(__name__, static_folder=str(HERE / "static"), static_url_path="")
-engine = None  # set in main()
-
-
-@app.route("/")
-def index():
-    return app.send_static_file("index.html")
-
-
-@app.route("/video")
-def video():
-    def generate():
-        last = -1
-        while True:
-            last, jpg = engine.wait_frame(last)
-            if jpg is None:
-                continue
-            yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
-                   + jpg + b"\r\n")
-    return Response(generate(),
-                    mimetype="multipart/x-mixed-replace; boundary=frame")
-
-
-@app.route("/api/state")
-def api_state():
-    return jsonify(engine.snapshot())
-
-
-def reply(result):
-    ok, error = result
-    return jsonify({"ok": ok, "error": error}), (200 if ok else 400)
-
-
-@app.route("/api/mode", methods=["POST"])
-def api_mode():
-    return reply(engine.set_mode((request.get_json(silent=True) or {})
-                                 .get("mode")))
-
-
-@app.route("/api/calibrate", methods=["POST"])
-def api_calibrate():
-    body = request.get_json(silent=True) or {}
-    return reply(engine.start_calibration(body.get("pose"),
-                                          body.get("finger")))
-
-
-@app.route("/api/rps/start", methods=["POST"])
-def api_rps_start():
-    return reply(engine.start_round())
-
-
-@app.route("/api/tuning", methods=["POST"])
-def api_tuning():
-    body = request.get_json(silent=True) or {}
-    return reply(engine.update_tuning(body.get("finger"),
-                                      body.get("settings"),
-                                      bool(body.get("save"))))
-
-
-@app.route("/api/tuning/preset", methods=["POST"])
-def api_tuning_preset():
-    body = request.get_json(silent=True) or {}
-    return reply(engine.apply_preset(body.get("finger"), body.get("id")))
-
-
-@app.route("/api/tuning/reset", methods=["POST"])
-def api_tuning_reset():
-    return reply(engine.reset_finger(
-        (request.get_json(silent=True) or {}).get("finger")))
+def verdict(player, robot):
+    if player == robot:
+        return "DRAW"
+    return "YOU WIN" if BEATS[player] == robot else "ROBOT WINS"
+
+
+def consensus(samples):
+    if not samples:
+        return None
+    label, count = Counter(samples).most_common(1)[0]
+    if label and count >= 2 and count / len(samples) >= 2 / 3:
+        return label
+    return None
 
 
 def main():
-    global engine
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--port", help="Arduino serial port; omit for no robot")
-    parser.add_argument("--source", default="0",
-                        help="camera index or stream URL (default 0)")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--web-port", type=int, default=5000)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--camera", type=int, default=0)
+    parser.add_argument("--port", help="UNO serial port (omit for preview)")
+    parser.add_argument("--window", type=float, default=0.5, help="capture seconds")
+    parser.add_argument("--calibration", type=Path, default=None,
+                        help="calibration.json (default: beside d3g_bend.py)")
+    parser.add_argument("--tuning", type=Path, default=None,
+                        help="finger_tuning.json (default: beside d3g_bend.py, else repo root)")
     args = parser.parse_args()
+    if not math.isfinite(args.window) or args.window <= 0:
+        parser.error("--window must be a positive finite number")
 
-    source = int(args.source) if args.source.isdigit() else args.source
-    engine = Engine(source, args.port)
-    worker = threading.Thread(target=engine.run, daemon=True)
-    worker.start()
+    import d3g_bend as hand
+    finger_tuning = hand.finger_tuning
+    NAMES = hand.NAMES
+    import cv2
+    import numpy as np
+    from mediapipe.tasks import python
+    from mediapipe.tasks.python import vision
 
+    folder = Path(hand.__file__).resolve().parent
+    model = next((folder / name for name in ("hand_landmarker.task", "hand_landmarker(1).task")
+                  if (folder / name).is_file()), None)
+    if model is None:
+        parser.error("Place hand_landmarker.task beside d3g_bend.py")
+    calibration_file = args.calibration or folder / "calibration.json"
+    tuning_file = args.tuning or hand.find_tuning_file()
+    if tuning_file is not None and tuning_file.is_file():
+        settings = finger_tuning.load_settings(tuning_file)
+        print(f"Tuning: {tuning_file}")
+    else:
+        settings = finger_tuning.default_settings()
+        print("Tuning: finger_tuning.json not found - using built-in defaults.")
+    options = vision.HandLandmarkerOptions(
+        base_options=python.BaseOptions(model_asset_buffer=model.read_bytes()),
+        running_mode=vision.RunningMode.VIDEO, num_hands=1)
+    camera = hand.open_camera(args.camera)
+    link = None
     try:
-        app.run(host=args.host, port=args.web_port,
-                threaded=True, debug=False)
+        if args.port:
+            import serial
+            link = serial.Serial(args.port, 115200, timeout=0, write_timeout=0.3)
+            time.sleep(2)
+            link.reset_input_buffer()
+
+        state = "READY"
+        cal_open, cal_closed = finger_tuning.load_calibration(calibration_file)
+        calibration = robot = None
+
+        def fist_usable(fist):
+            """Every finger (thumb..pinky) must give a usable value."""
+            return all(finger_tuning.compute(
+                n, fist[n], cal_open[n], fist[n], settings[n])["output"] is not None
+                for n in NAMES)
+
+        samples, votes = [], []
+        start = cue = last_send = 0.0
+        last_stamp = -1
+        if cal_closed is not None and not fist_usable(cal_closed):
+            cal_open = cal_closed = None
+            message = "Saved calibration doesn't fit the current tuning. Press O."
+        elif cal_closed is not None:
+            message = "Saved calibration loaded. SPACE to play (O / C to redo)."
+        else:
+            message = "Show an open hand and press O."
+        result = ""
+        title = "Robot Hand | Rock Paper Scissors"
+        with vision.HandLandmarker.create_from_options(options) as detector:
+            while True:
+                ok, frame = camera.read()
+                acquired = time.monotonic()
+                if not ok or frame is None:
+                    raise RuntimeError("No camera frame. Close the basic-mode program first.")
+                frame = cv2.flip(frame, 1)
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                stamp = max(last_stamp + 1, int(acquired * 1000))
+                last_stamp = stamp
+                detection = detector.detect_for_video(
+                    hand.mp.Image(image_format=hand.mp.ImageFormat.SRGB, data=rgb), stamp)
+                feats = values = None
+                if detection.hand_world_landmarks:
+                    try:
+                        feats = finger_tuning.hand_features(
+                            [(p.x, p.y, p.z) for p in detection.hand_world_landmarks[0]])
+                    except ValueError:
+                        pass
+                if calibration:
+                    if feats is None:
+                        samples.clear()
+                    else:
+                        samples.append(finger_tuning.hand_vector(feats))
+                    message = f"Hold {calibration}: {len(samples)}/30"
+                    if len(samples) == 30:
+                        average = finger_tuning.split_vector(np.median(samples, axis=0))
+                        if calibration == "OPEN":
+                            cal_open = average
+                            message = "Open saved. Make a fist and press C."
+                        elif fist_usable(average):
+                            cal_closed = average
+                            finger_tuning.save_calibration(calibration_file, cal_open, cal_closed)
+                            message = "Calibration ready."
+                        else:
+                            message = "Small bend range. Make a tighter fist and press C."
+                        calibration = None
+                        samples.clear()
+                if feats is not None and cal_closed is not None:
+                    outputs = [finger_tuning.compute(
+                        n, feats[n], cal_open[n], cal_closed[n], settings[n])["output"]
+                        for n in NAMES]
+                    if None not in outputs:
+                        values = np.array(outputs)
+                player = classify(values)
+                now = time.monotonic()
+                if state == "COUNTDOWN" and now - start >= 3:
+                    state = "SHOOT"
+                    robot = random.choice(tuple(POSES))
+                    votes.clear()
+                if state == "CAPTURE":
+                    if cue <= acquired <= cue + args.window:
+                        votes.append(player)
+                    if now >= cue + args.window:
+                        chosen = consensus(votes)
+                        result = (f"{chosen} vs {robot}  |  {verdict(chosen, robot)}"
+                                  if chosen else "No clear throw. Try again.")
+                        state = "RESULT"
+                if state == "COUNTDOWN":
+                    headline = str(max(1, math.ceil(3 - (now - start))))
+                elif state in ("SHOOT", "CAPTURE"):
+                    headline = "SHOW!"
+                elif state == "RESULT":
+                    headline = result
+                else:
+                    headline = "READY"
+
+                # A fixed-width panel keeps text legible even with a small camera frame.
+                width = max(640, frame.shape[1])
+                canvas = np.zeros((frame.shape[0] + 166, width, 3), dtype=np.uint8)
+                canvas[:frame.shape[0], :frame.shape[1]] = frame
+                status = message
+                if state == "READY" and cal_closed is not None and not calibration:
+                    status = "Live: " + (player or ("UNCLEAR" if feats is not None else "NO HAND"))
+                    if values is not None:
+                        status += "   T I M R P: " + " ".join(str(round(v)) for v in values)
+                rows = [(headline, 0.88), (status if state == "READY" else "", 0.55),
+                        ("O: open   C: fist   SPACE: play again/start   ESC: quit", 0.55),
+                        ("Ready/test keys: 1 rock   2 paper   3 scissors", 0.55),
+                        ("USB: " + (args.port or "preview only"), 0.5)]
+                for i, (line, scale) in enumerate(rows):
+                    cv2.putText(canvas, line, (10, frame.shape[0] + 30 + 30*i),
+                                cv2.FONT_HERSHEY_SIMPLEX, scale, (100, 255, 200), 1, cv2.LINE_AA)
+                cv2.imshow(title, canvas)
+                key = cv2.waitKey(1) & 255
+                if key == 27:
+                    break
+                if state == "SHOOT":
+                    cue = time.monotonic()
+                    last_send = 0.0
+                    state = "CAPTURE"
+                if state in ("READY", "RESULT"):
+                    if key == 32 and cal_closed is not None and calibration is None:
+                        start = time.monotonic()
+                        robot = None
+                        state = "COUNTDOWN"
+                    elif key in (ord("o"), ord("O"), ord("c"), ord("C")):
+                        state = "READY"
+                        robot = None
+                        if chr(key).upper() == "O":
+                            cal_open = cal_closed = None
+                            calibration = "OPEN"
+                        elif cal_open is not None:
+                            cal_closed = None
+                            calibration = "FIST"
+                        samples.clear()
+                    elif key in map(ord, "123"):
+                        state = "READY"
+                        robot = ("ROCK", "PAPER", "SCISSORS")[key - ord("1")]
+                        message = "Test: " + robot
+                        print(message, flush=True)
+                now = time.monotonic()
+                if link and now - last_send >= 0.05:
+                    packet = ",".join(map(str, POSES[robot])) if robot else "STOP"
+                    link.write((packet + "\n").encode("ascii"))
+                    last_send = now
+                    if link.in_waiting:
+                        link.read(min(link.in_waiting, 4096))
     finally:
-        engine.stop_event.set()
-        worker.join(timeout=3)
+        camera.release()
+        cv2.destroyAllWindows()
+        if link is not None:
+            try:
+                link.write(b"STOP\n")
+            finally:
+                link.close()
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

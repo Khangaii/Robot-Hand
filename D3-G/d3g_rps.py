@@ -21,10 +21,18 @@ PATTERNS = {tuple(v[1:]): k for k, v in POSES.items()}
 
 
 def classify(values):
+    """values: bend % for thumb, index, middle, ring, pinky (or None)."""
     if values is None:
         return None
-    pattern = tuple(0 if v <= 30 else 100 if v >= 65 else None for v in values)
-    return PATTERNS.get(pattern)
+    # Index..pinky decide rock / paper / classic scissors; the thumb is ignored.
+    pattern = tuple(0 if v <= 30 else 100 if v >= 65 else None for v in values[1:])
+    label = PATTERNS.get(pattern)
+    if label:
+        return label
+    # Extended thumb + index with the other three curled also counts as scissors.
+    if values[0] <= 30 and pattern == (0, 100, 100, 100):
+        return "SCISSORS"
+    return None
 
 
 def verdict(player, robot):
@@ -93,15 +101,18 @@ def main():
         calibration = robot = None
 
         def fist_usable(fist):
-            """Every finger the game reads (index..pinky) must give a usable value."""
+            """Every finger (thumb..pinky) must give a usable value."""
             return all(finger_tuning.compute(
                 n, fist[n], cal_open[n], fist[n], settings[n])["output"] is not None
-                for n in NAMES[1:])
+                for n in NAMES)
 
         samples, votes = [], []
         start = cue = last_send = 0.0
         last_stamp = -1
-        if cal_closed is not None:
+        if cal_closed is not None and not fist_usable(cal_closed):
+            cal_open = cal_closed = None
+            message = "Saved calibration doesn't fit the current tuning. Press O."
+        elif cal_closed is not None:
             message = "Saved calibration loaded. SPACE to play (O / C to redo)."
         else:
             message = "Show an open hand and press O."
@@ -146,9 +157,11 @@ def main():
                         calibration = None
                         samples.clear()
                 if feats is not None and cal_closed is not None:
-                    values = np.array([finger_tuning.compute(
+                    outputs = [finger_tuning.compute(
                         n, feats[n], cal_open[n], cal_closed[n], settings[n])["output"]
-                        for n in NAMES[1:]])
+                        for n in NAMES]
+                    if None not in outputs:
+                        values = np.array(outputs)
                 player = classify(values)
                 now = time.monotonic()
                 if state == "COUNTDOWN" and now - start >= 3:
@@ -180,7 +193,7 @@ def main():
                 if state == "READY" and cal_closed is not None and not calibration:
                     status = "Live: " + (player or ("UNCLEAR" if feats is not None else "NO HAND"))
                     if values is not None:
-                        status += "   I M R P: " + " ".join(str(round(v)) for v in values)
+                        status += "   T I M R P: " + " ".join(str(round(v)) for v in values)
                 rows = [(headline, 0.88), (status if state == "READY" else "", 0.55),
                         ("O: open   C: fist   SPACE: play again/start   ESC: quit", 0.55),
                         ("Ready/test keys: 1 rock   2 paper   3 scissors", 0.55),
